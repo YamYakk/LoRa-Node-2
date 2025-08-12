@@ -1,0 +1,172 @@
+// ============================================================================
+// main.cpp — RadioLib LoRaWAN OTAA with session persistence + Heltec V3 Battery
+// Target: ESP32/ESP32-S3 + RadioLib (LoRaWAN)
+// Requires:
+//   - jgromes/RadioLib with LoRaWAN support
+//   - Arduino-ESP32 core (Preferences + analogReadMilliVolts)
+//   - Your "config_node5.h" must define:
+//       radio, node, joinEUI, devEUI, nwkKey, appKey, uplinkIntervalSeconds
+//
+// What this does
+//   1) First run: OTAA join, then after first successful uplink it saves the
+//      session (keys, nonces, FCnt) to NVS.
+//   2) Reboot: restores session (no join), sends uplinks immediately, and saves
+//      the session after every uplink to keep FCnt in sync.
+//   3) Reads battery voltage on Heltec WiFi LoRa 32 V3 by pulling GPIO37 LOW to
+//      route VBAT to GPIO1 through a 390k/100k divider, then reads ADC.
+//
+// Tip: If you ever need to force a fresh join, temporarily clear NVS "lw"
+//      namespace (see optional factory reset snippet below).
+// ============================================================================
+
+#include <Arduino.h>
+#include <Preferences.h>
+#include "config_node5.h"
+
+// ---------------- Battery Monitor Config (Heltec V3) ----------------
+static const int   BAT_EN_PIN        = 37;     // LOW enables VBAT path
+static const int   BAT_ADC_PIN       = 1;      // GPIO1 = VBAT_Read (Pin 12)
+static const float BAT_DIVIDER_RATIO = 4.90f;  // 390k : 100k
+#define BAT_SAMPLES   8
+#define USE_MV_API    true            // << use calibrated millivolts API
+
+// Single definition (remove any duplicate earlier lines)
+static uint16_t readBatteryMilliVolts() {
+  uint32_t acc = 0;
+  for (int i = 0; i < BAT_SAMPLES; i++) {
+    acc += analogReadMilliVolts(BAT_ADC_PIN);   // uses ADC calib on ESP32-S3
+    delay(2);
+  }
+  uint32_t pin_mV = acc / BAT_SAMPLES;                       // at GPIO1
+  uint32_t bat_mV = (uint32_t)(pin_mV * BAT_DIVIDER_RATIO + 0.5f);
+  if (bat_mV > 65535) bat_mV = 65535;
+  return (uint16_t)bat_mV;
+}
+
+// ====================== [ LoRaWAN Session Persistence ] =====================
+Preferences _prefs;  // NVS namespace "lw"
+
+// Try to restore saved session (nonces + session buffers).
+// Returns true if RadioLib reports SESSION_RESTORED.
+static bool lwRestore(LoRaWANNode& n) {
+  if (!_prefs.begin("lw", false)) return false;
+
+  if (_prefs.getBytesLength("n") != RADIOLIB_LORAWAN_NONCES_BUF_SIZE ||
+      _prefs.getBytesLength("s") != RADIOLIB_LORAWAN_SESSION_BUF_SIZE) {
+    return false;
+  }
+
+  uint8_t nonces[RADIOLIB_LORAWAN_NONCES_BUF_SIZE];
+  uint8_t sess  [RADIOLIB_LORAWAN_SESSION_BUF_SIZE];
+  _prefs.getBytes("n", nonces, sizeof(nonces));
+  _prefs.getBytes("s", sess,   sizeof(sess));
+
+  if (n.setBufferNonces(nonces)  != RADIOLIB_ERR_NONE) return false;
+  if (n.setBufferSession(sess)   != RADIOLIB_ERR_NONE) return false;
+
+  int16_t st = n.activateOTAA();  // will return SESSION_RESTORED if accepted
+  return (st == RADIOLIB_LORAWAN_SESSION_RESTORED);
+}
+
+// Save current session + nonces after a successful uplink to keep FCnt aligned.
+static void lwSave(LoRaWANNode& n) {
+  uint8_t nonces[RADIOLIB_LORAWAN_NONCES_BUF_SIZE];
+  uint8_t sess  [RADIOLIB_LORAWAN_SESSION_BUF_SIZE];
+  memcpy(nonces, n.getBufferNonces(),  sizeof(nonces));
+  memcpy(sess,   n.getBufferSession(), sizeof(sess));
+  _prefs.putBytes("n", nonces, sizeof(nonces));
+  _prefs.putBytes("s", sess,   sizeof(sess));
+  Serial.println(F("[LW] Session saved."));
+}
+
+// Optional: hold a pin on boot to clear saved session (factory reset)
+/*
+static void lwClearIfButtonHeld() {
+  const int BTN = 0; // adjust for your board
+  pinMode(BTN, INPUT_PULLUP);
+  if (!digitalRead(BTN)) {
+    if (_prefs.begin("lw", false)) { _prefs.clear(); _prefs.end(); }
+    Serial.println(F("[LW] Cleared saved session."));
+  }
+}
+*/
+
+// ================================= [ Setup ] =================================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {}
+  delay(800);
+  Serial.println(F("\n=== LoRaWAN OTAA + Persistence + Battery (Heltec V3) ==="));
+
+  // --- Battery path + ADC init (do this BEFORE LoRaWAN) ---
+  pinMode(BAT_EN_PIN, OUTPUT);
+  digitalWrite(BAT_EN_PIN, LOW);                 // enable VBAT route to ADC
+  analogReadResolution(12);                      // 12-bit ADC
+  analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);// headroom up to ~3.3V at pin
+
+  // one-shot debug
+uint16_t pin_mV  = analogReadMilliVolts(BAT_ADC_PIN);
+uint16_t batt_mV = (uint16_t)(pin_mV * BAT_DIVIDER_RATIO + 0.5f);
+Serial.printf("[BAT-DBG] GPIO1=%u mV  -> VBAT ~ %u mV\n", pin_mV, batt_mV);
+
+  // lwClearIfButtonHeld(); // optional "factory reset" if you wire a button
+
+  // --- Radio + LoRaWAN init ---
+  int16_t st = radio.begin();
+  if (st != RADIOLIB_ERR_NONE) {
+    Serial.printf("Radio init failed: %d\n", st);
+    while (1) delay(50);
+  }
+
+  st = node.beginOTAA(joinEUI, devEUI, nwkKey, appKey);
+  if (st != RADIOLIB_ERR_NONE) {
+    Serial.printf("Node init failed: %d\n", st);
+    while (1) delay(50);
+  }
+
+  // --- Try to restore existing session (skips OTAA if it works) ---
+  if (lwRestore(node)) {
+    Serial.println(F("Session restored ✔ (no join)"));
+  } else {
+    Serial.println(F("No session to restore; performing OTAA join..."));
+    st = node.activateOTAA();
+    if (st != RADIOLIB_LORAWAN_NEW_SESSION) {
+      Serial.printf("Join failed: %d\n", st);
+      while (1) delay(500);
+    }
+    Serial.println(F("Joined new session ✔"));
+    // Do NOT save here — we save after the first successful uplink
+  }
+
+  Serial.println(F("Ready.\n"));
+}
+
+// ================================= [ Loop ] ==================================
+void loop() {
+  // --- Battery read (GPIO37 must already be LOW in setup) ---
+  // Quick sanity: raw ADC mV at GPIO1 (VBAT_Read)
+  uint16_t adc_mV  = analogReadMilliVolts(1);      // ADC1_CH0 = GPIO1
+  // Scaled battery voltage using your read function (×4.9)
+  uint16_t batt_mv = readBatteryMilliVolts();
+  Serial.printf("[ADC1] %u mV  |  [BAT] %u mV\n", adc_mV, batt_mv);
+
+  // --- Build payload: 3 demo bytes + 2 bytes battery mV (big-endian) ---
+  uint8_t  v1 = radio.random(100);
+  uint16_t v2 = radio.random(2000);
+  uint8_t  payload[5] = {
+    v1,
+    (uint8_t)(v2 >> 8), (uint8_t)(v2 & 0xFF),
+    (uint8_t)(batt_mv >> 8), (uint8_t)(batt_mv & 0xFF)
+  };
+
+  // --- Send uplink (unconfirmed by default) ---
+  int16_t st = node.sendReceive(payload, sizeof(payload));
+  if (st < RADIOLIB_ERR_NONE) {
+    Serial.printf("sendReceive error: %d\n", st);
+  } else {
+    // Save session after EVERY successful uplink (keeps FCnt in sync)
+    lwSave(node);
+  }
+
+  delay(uplinkIntervalSeconds * 1000UL);
+}
